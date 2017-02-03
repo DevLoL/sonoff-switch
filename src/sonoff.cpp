@@ -1,10 +1,14 @@
-#include <Updater.h>
-#include <Arduino.h>
-#include <ESP8266mDNS.h>
-#include <ArduinoOTA.h>
-#include "Espanol.h"
+#include "Arduino.h"
 
-#define DEBUG
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <PubSubClient.h>
+
+extern "C" {
+#include "user_interface.h"
+}
+
+#include "wifi_credentials.h"
 
 #define SWITCH_NUMBER_STRING "3"
 
@@ -14,59 +18,35 @@
 
 #define DEBOUNCE_COUNTER_START 150
 
-#define HOSTNAME "switch-" SWITCH_NUMBER_STRING
+/* Network */
+ESP8266WiFiMulti wifiMulti;
+WiFiClient wclient;
+/**********/
 
-#define WIFI_SSID     "HaSi-Kein-Internet-Legacy"
-#define WIFI_PASSWORD "bugsbunny"
-
-#define OTA_PASSWORD "bugsbunny"
-
-#define MQTT_BROKER "atlas.hasi"
-#define MQTT_PORT   1883
-
-#define RESPONSE_SUFFIX              "/response"
-#define SWITCH_TOPIC                 "hasi/switches/" SWITCH_NUMBER_STRING
-#define SWITCH_TOPICS_TOPIC          SWITCH_TOPIC "/topics"
-#define SWITCH_TOPICS_RESPONSE_TOPIC SWITCH_TOPICS_TOPIC RESPONSE_SUFFIX
-#define SWITCH_HELP_TOPIC            SWITCH_TOPIC "/help"
-#define SWITCH_HELP_RESPONSE_TOPIC   SWITCH_HELP_TOPIC RESPONSE_SUFFIX
-#define SWITCH_STATE_TOPIC           SWITCH_TOPIC "/state"
-#define SWITCH_STATE_RESPONSE_TOPIC  SWITCH_STATE_TOPIC RESPONSE_SUFFIX
-
-#define TOPICS_LIST "topics:string,help:string,state:string"
-
-#define HELP_MESSAGE "Switch (hasi/switches/" SWITCH_NUMBER_STRING ")\n" \
-                     "\n" \
-                     "This switch is a Sonoff switch switchable over MQTT.\n" \
-                     "\n" \
-                     "TOPICS\n" \
-                     "    state: \"on\" or \"off\"\n" \
-                     "        - Set switch on or off"
+/* MQTT */
+String MQTT_USERNAME = "sonof_1";
+String MQTT_TOPIC = "sonoff/1/";
+IPAddress MQTTserver(158, 255, 212, 248);
+PubSubClient client(MQTTserver, 1883, wclient);
+/***********/
 
 bool relayOn = false;
 
+
 void switchRelayOn()
 {
-#ifdef DEBUG
-    Serial.println("Turning the relay on");
-#endif
-
-    digitalWrite(RELAY_PIN, HIGH);
-    digitalWrite(LED_PIN, HIGH);
-
+    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
     relayOn = true;
+    client.publish((MQTT_TOPIC + "relay").c_str(), relayOn ? "ON" : "OFF", true);
 }
 
 void switchRelayOff()
 {
-#ifdef DEBUG
-    Serial.println("Turning the relay off");
-#endif
-
-    digitalWrite(RELAY_PIN, LOW);
-    digitalWrite(LED_PIN, LOW);
-
+    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(LED_PIN, HIGH);
     relayOn = false;
+    client.publish((MQTT_TOPIC + "relay").c_str(), relayOn ? "ON" : "OFF", true);
 }
 
 void toggleRelay()
@@ -83,105 +63,98 @@ void toggleRelay()
 
 void setup()
 {
-#ifdef DEBUG
-    Serial.begin(115200);
-    Espanol.setDebug(true);
-
-    Serial.println("Booting...");
-#endif
-
     delay(10);
 
     pinMode(RELAY_PIN, OUTPUT);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
 
-    Espanol.subscribe(SWITCH_TOPICS_TOPIC);
-    Espanol.subscribe(SWITCH_HELP_TOPIC);
-    Espanol.subscribe(SWITCH_STATE_TOPIC);
-    Espanol.begin(WIFI_SSID, WIFI_PASSWORD, HOSTNAME, MQTT_BROKER, MQTT_PORT);
-
-    Espanol.setCallback([](char *cTopicStr, uint8_t *bytes, unsigned int length) {
-        String content, topic;
-
-        topic = String(cTopicStr);
-
-        char *cContentStr = new char[length + 1];
-        memcpy(cContentStr, bytes, length);
-        cContentStr[length] = '\0';
-        content = String(cContentStr);
-        free(cContentStr);
-
-        if (topic.equals(SWITCH_TOPICS_TOPIC))
-        {
-            if (content.equals("get"))
-            {
-                Espanol.publish(SWITCH_TOPICS_RESPONSE_TOPIC, TOPICS_LIST);
-            }
-        }
-        else if (topic.equals(SWITCH_HELP_TOPIC))
-        {
-            if (content.equals("get"))
-            {
-                Espanol.publish(SWITCH_HELP_RESPONSE_TOPIC, HELP_MESSAGE);
-            }
-        }
-        else if (topic.equals(SWITCH_STATE_TOPIC))
-        {
-            if (content.equals("get"))
-            {
-                Espanol.publish(SWITCH_STATE_RESPONSE_TOPIC, relayOn ? "on" : "off");
-            }
-            else if (content.equals("on"))
-            {
-                switchRelayOn();
-            }
-            else if (content.equals("off"))
-            {
-                switchRelayOff();
-            }
-        }
-    });
-
-    switchRelayOff();
-
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        Espanol.loop();
-        delay(100);
+    Serial.begin(115200);
+    delay(1000);
+  
+    for (int i=0; i<NUM_WIFI_CREDENTIALS; i++) {
+        wifiMulti.addAP(WIFI_CREDENTIALS[i][0], WIFI_CREDENTIALS[i][1]);
     }
 
-    ArduinoOTA.setHostname(HOSTNAME);
-    ArduinoOTA.setPassword(OTA_PASSWORD);
-    ArduinoOTA.begin();
+    if(wifiMulti.run() == WL_CONNECTED) {
+        Serial.println("Wifi connected.");
+    } else {
+        Serial.println("Wifi not connected!");
+    }
 }
 
-void loop()
-{
+
+/* inefficient but i see no better way atm */
+inline String byteArrayToString(byte* array, unsigned int length) {
+    char chars[length+1];
+    for (int i=0; i<length; i++) {
+        chars[i] =  (char) array[i];
+    }
+    chars[length] = '\0';
+    return chars;
+}
+
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  
+    String msg = byteArrayToString(payload, length);
+
+    if (msg == "ON") {
+        switchRelayOn();
+    } else if (msg == "OFF") {
+        switchRelayOff();
+    } else if (msg == "TOGGL") {
+        toggleRelay();
+    }
+
+}
+
+
+void loop() {
+
     static int lastButtonState = HIGH;
     static int debounceCounter = 0;
+    static unsigned int counter = 0;
+    static bool wifiConnected = false;
 
-    ArduinoOTA.handle();
-    Espanol.loop();
-
-    if (debounceCounter > 0)
-    {
-        if (debounceCounter == 1)
-        {
+    if (debounceCounter > 0) {
+        if (debounceCounter == 1) {
             int newButtonState = lastButtonState == HIGH ? LOW : HIGH;
-
-            if (newButtonState == LOW)
-            {
+            if (newButtonState == LOW) {
                 toggleRelay();
+                client.publish((MQTT_TOPIC + "button").c_str(), "PRESS", true);
             }
-
             lastButtonState = newButtonState;
         }
-
         debounceCounter--;
-    }
-    else if (lastButtonState != digitalRead(BUTTON_PIN))
-    {
+    } else if (lastButtonState != digitalRead(BUTTON_PIN)) {
         debounceCounter = DEBOUNCE_COUNTER_START;
+    }
+
+    /* reconnect wifi */
+    if(wifiMulti.run() == WL_CONNECTED) {
+        if (!wifiConnected) {
+            Serial.println("Wifi connected.");
+            wifiConnected = true;
+        }
+    } else {
+        if (wifiConnected) {
+            Serial.println("Wifi not connected!");
+            wifiConnected = false;
+        }
+    }
+
+    /* MQTT */
+    if (client.connected()) {
+        client.loop();
+    } else {
+        if (client.connect(MQTT_USERNAME.c_str(), (MQTT_TOPIC + "online").c_str(), 0, true, "false")) {
+            client.publish((MQTT_TOPIC + "online").c_str(), relayOn ? "on" : "off", true);
+            // clear the CMD topic on boot in case a cmd was retained
+            client.publish((MQTT_TOPIC + "cmd").c_str(), "NOCMD", true);
+            Serial.println("MQTT connected");
+            client.setCallback(mqtt_callback);
+            client.subscribe((MQTT_TOPIC + "cmd").c_str());
+        }
     }
 }
