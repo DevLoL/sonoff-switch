@@ -18,6 +18,8 @@ extern "C" {
 
 #define DEBOUNCE_COUNTER_START 150
 
+bool defaultOn = true;
+
 /* Network */
 ESP8266WiFiMulti wifiMulti;
 WiFiClient wclient;
@@ -35,7 +37,7 @@ bool relayOn = false;
 
 void switchRelayOn()
 {
-    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(RELAY_PIN, HIGH);
     digitalWrite(LED_PIN, LOW);
     relayOn = true;
     client.publish((MQTT_TOPIC + "relay").c_str(), relayOn ? "ON" : "OFF", true);
@@ -43,7 +45,7 @@ void switchRelayOn()
 
 void switchRelayOff()
 {
-    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(RELAY_PIN, LOW);
     digitalWrite(LED_PIN, HIGH);
     relayOn = false;
     client.publish((MQTT_TOPIC + "relay").c_str(), relayOn ? "ON" : "OFF", true);
@@ -69,12 +71,21 @@ void setup()
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
 
+    // defaults to off
+    if (defaultOn) {
+        switchRelayOn();
+    } else {
+        switchRelayOff();
+    }
+  
     Serial.begin(115200);
     delay(1000);
-  
+    Serial.println("in setup");
+
     for (int i=0; i<NUM_WIFI_CREDENTIALS; i++) {
         wifiMulti.addAP(WIFI_CREDENTIALS[i][0], WIFI_CREDENTIALS[i][1]);
     }
+    Serial.println("added wifi credentials");
 
     if(wifiMulti.run() == WL_CONNECTED) {
         Serial.println("Wifi connected.");
@@ -112,25 +123,36 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 
 void loop() {
 
-    static int lastButtonState = HIGH;
-    static int debounceCounter = 0;
-    static unsigned int counter = 0;
-    static bool wifiConnected = false;
+    /**** button handling and debouncing ****/
+    static int lastButtonState = LOW;
+    static unsigned long buttonPressTime = 0;
+    static bool inDebounce = false;
 
-    if (debounceCounter > 0) {
-        if (debounceCounter == 1) {
+    if (digitalRead(BUTTON_PIN) != lastButtonState) { //if pressed or unpressed
+
+        if (inDebounce) {
+            unsigned long cmillis = millis();
+            if (buttonPressTime + 50 < cmillis) {
+                inDebounce = false;
+            }
+            if (cmillis < buttonPressTime) { // on integer overflow
+                inDebounce = false;
+            }
+        } else {
+            inDebounce = true;
+            buttonPressTime = millis();
             int newButtonState = lastButtonState == HIGH ? LOW : HIGH;
             if (newButtonState == LOW) {
+                Serial.println("button pressed");
                 toggleRelay();
                 client.publish((MQTT_TOPIC + "button").c_str(), "PRESS", true);
             }
             lastButtonState = newButtonState;
         }
-        debounceCounter--;
-    } else if (lastButtonState != digitalRead(BUTTON_PIN)) {
-        debounceCounter = DEBOUNCE_COUNTER_START;
     }
 
+    /**** WIFI and MQTT reconnecting *****/
+    static bool wifiConnected = false;
     /* reconnect wifi */
     if(wifiMulti.run() == WL_CONNECTED) {
         if (!wifiConnected) {
@@ -142,6 +164,7 @@ void loop() {
             Serial.println("Wifi not connected!");
             wifiConnected = false;
         }
+        return;
     }
 
     /* MQTT */
@@ -152,9 +175,11 @@ void loop() {
             client.publish((MQTT_TOPIC + "online").c_str(), relayOn ? "on" : "off", true);
             // clear the CMD topic on boot in case a cmd was retained
             client.publish((MQTT_TOPIC + "cmd").c_str(), "NOCMD", true);
+            client.publish((MQTT_TOPIC + "relay").c_str(), relayOn ? "ON" : "OFF", true);
             Serial.println("MQTT connected");
             client.setCallback(mqtt_callback);
             client.subscribe((MQTT_TOPIC + "cmd").c_str());
         }
     }
+
 }
